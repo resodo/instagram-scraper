@@ -315,6 +315,15 @@ class InstagramScraper(object):
             except requests.exceptions.RequestException:
                 self.logger.warning('Failed to log out ' + self.login_user)
 
+    def get_profile_file(self):
+        """Gets the destination file for profile."""
+        profile_file_name = "profile.json"
+        if self.destination == './':
+            dst = './' + profile_file_name
+        else:
+            dst = self.destination + '/' + profile_file_name
+        return dst
+
     def get_dst_dir(self, username):
         """Gets the destination directory and last scraped file time."""
         if self.destination == './':
@@ -617,6 +626,46 @@ class InstagramScraper(object):
             details = self.__get_media_details(code)
             item['location'] = details.get('location')
 
+    def scrape_profile(self, executor=concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS)):
+        """Crawls through and downloads user's profile"""
+        self.session.headers.update({'user-agent': STORIES_UA})
+        profile_data = {}
+
+        try:
+            dst = self.get_profile_file()
+            if os.path.exists(dst):
+                with open(dst, 'r') as f:
+                    profile_data = json.load(f)
+
+            for username in self.usernames:
+                if username in profile_data:
+                    self.logger.info('{0} skipped for exists'.format(username))
+                    continue
+
+                self.logger.info('trying to get {0}'.format(username))
+                # Get the user metadata.
+                shared_data = self.get_shared_data(username)
+                user = self.deep_get(shared_data, 'entry_data.ProfilePage[0].graphql.user')
+
+                if not user:
+                    self.logger.error(
+                        'Error getting user details for {0}. Please verify that the user exists.'.format(username))
+                    continue
+                elif user and user['is_private'] and user['edge_owner_to_timeline_media']['count'] > 0 and not \
+                        user['edge_owner_to_timeline_media']['edges']:
+                    self.logger.info('User {0} is private'.format(username))
+
+                self.rhx_gis = ""
+
+                profile = self.get_profile_info_without_save(username)
+
+                if profile is not None:
+                    profile_data[username] = profile
+        finally:
+            self.save_json(profile_data, dst)
+            self.quit = True
+            self.logout()
+
     def scrape(self, executor=concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS)):
         """Crawls through and downloads user's media"""
         self.session.headers.update({'user-agent': STORIES_UA})
@@ -721,6 +770,37 @@ class InstagramScraper(object):
                                   ncols=0, disable=self.quiet):
                 future = executor.submit(self.worker_wrapper, self.download, item, dst)
                 future_to_item[future] = item
+
+    def get_profile_info_without_save(self, username):
+        url = USER_URL.format(username)
+        resp = self.get_json(url)
+
+        if resp is None:
+            self.logger.error('Error getting user info for {0}'.format(username))
+            return
+
+        self.logger.info( 'Got metadata general information from {0}'.format(username) )
+
+        user_info = json.loads(resp)['graphql']['user']
+
+        try:
+            profile_info = {
+                'biography': user_info['biography'],
+                'followers_count': user_info['edge_followed_by']['count'],
+                'following_count': user_info['edge_follow']['count'],
+                'full_name': user_info['full_name'],
+                'id': user_info['id'],
+                'is_business_account': user_info['is_business_account'],
+                'is_joined_recently': user_info['is_joined_recently'],
+                'is_private': user_info['is_private'],
+                'posts_count': user_info['edge_owner_to_timeline_media']['count'],
+                'profile_pic_url': user_info['profile_pic_url']
+            }
+            return profile_info
+        except (KeyError, IndexError, StopIteration):
+            self.logger.warning('Failed to build {0} profile info'.format(username))
+            return
+
 
     def get_profile_info(self, dst, username):
         if self.profile_metadata is False:
@@ -1511,6 +1591,7 @@ def main():
     parser.add_argument('--cookiejar', '--cookierjar', default=None,
                         help='File in which to store cookies so that they can be reused between runs.')
     parser.add_argument('--tag', action='store_true', default=False, help='Scrape media using a hashtag')
+    parser.add_argument('--profile-only', action='store_true', default=False, help='Scrape account profile only')
     parser.add_argument('--filter', default=None, help='Filter by tags in user posts', nargs='*')
     parser.add_argument('--filter-location', default=None, nargs="*", help="filter query by only accepting media with location filter as the location id")
     parser.add_argument('--filter-location-file', default=None, type=str, help="file containing list of locations to filter query by")
@@ -1595,6 +1676,8 @@ def main():
         scraper.scrape_location()
     elif args.search_location:
         scraper.search_locations()
+    elif args.profile_only:
+        scraper.scrape_profile()
     else:
         scraper.scrape()
 
